@@ -12,7 +12,7 @@ Manage multiple Claude CLI accounts on the same machine.
 
 <br>
 
-https://github.com/noor1yasser9/Claude-Account-Manager/releases/download/v1.0.0/demo.mp4
+<video src="https://github.com/noor1yasser9/Claude-Account-Manager/releases/download/v1.0.0/demo.mp4" controls width="100%"></video>
 
 </div>
 
