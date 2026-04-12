@@ -14,6 +14,10 @@ Manage multiple Claude CLI accounts on the same machine.
 
 [![Watch Demo](https://img.shields.io/badge/Watch_Demo-Video-c4a35a?style=for-the-badge&logo=youtube)](https://github.com/noor1yasser9/Claude-Account-Manager/releases/download/v1.0.0/demo.mp4)
 
+<br>
+
+<img src="screenshot.png" alt="Claude Account Manager" width="100%">
+
 </div>
 
 ---
