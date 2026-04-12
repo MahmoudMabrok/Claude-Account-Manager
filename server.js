@@ -3,6 +3,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execSync } = require('child_process');
 
 const app = express();
 const HOME = os.homedir();
@@ -10,12 +11,42 @@ const HOME = os.homedir();
 const PORT = parseInt(process.env.PORT) || 3737;
 const HOST = process.env.HOST || 'localhost';
 const ACCOUNTS_DIR = (process.env.ACCOUNTS_DIR || '~/.claude-accounts').replace('~', HOME);
-const BIN_DIR = process.env.BIN_DIR || '/usr/local/bin';
 const META_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 const DEFAULT_LANG = process.env.DEFAULT_LANG || 'ar';
 const DEFAULT_THEME = process.env.DEFAULT_THEME || 'dark';
 const AUTO_REFRESH_INTERVAL = parseInt(process.env.AUTO_REFRESH_INTERVAL) || 30000;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
+
+// Resolve BIN_DIR: use env, fallback to writable dir in PATH
+function resolveBinDir() {
+  const envBin = process.env.BIN_DIR;
+  if (envBin) return envBin;
+
+  // Try common dirs in order of preference
+  const candidates = [
+    '/usr/local/bin',
+    path.join(HOME, '.local', 'bin'),
+    path.join(HOME, 'bin'),
+  ];
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      // Test write permission
+      const testFile = path.join(dir, '.cam-test');
+      fs.writeFileSync(testFile, '', { mode: 0o755 });
+      fs.unlinkSync(testFile);
+      return dir;
+    } catch(e) { continue; }
+  }
+
+  // Last resort: use ~/.local/bin and create it
+  const fallback = path.join(HOME, '.local', 'bin');
+  fs.mkdirSync(fallback, { recursive: true });
+  return fallback;
+}
+
+const BIN_DIR = resolveBinDir();
 
 const ACCOUNT_COLORS = ['#c4a35a','#2563eb','#dc2626','#16a34a','#9333ea','#ec4899','#f97316','#06b6d4','#84cc16','#f43f5e'];
 
@@ -67,12 +98,40 @@ function generateScript(name) {
 exec env CLAUDE_CONFIG_DIR="${configDir(name)}" claude "$@"
 `;
   const dest = scriptPath(name);
-  fs.writeFileSync(dest, script, { mode: 0o755 });
+  try {
+    fs.writeFileSync(dest, script, { mode: 0o755 });
+  } catch(e) {
+    // Try with sudo as fallback
+    const tmpFile = path.join(os.tmpdir(), `claude-${name}`);
+    fs.writeFileSync(tmpFile, script, { mode: 0o755 });
+    try {
+      execSync(`cp "${tmpFile}" "${dest}" && chmod 755 "${dest}"`, { stdio: 'ignore' });
+    } catch(e2) {
+      throw new Error(`Cannot write to ${BIN_DIR}. Set BIN_DIR in .env to a writable directory.`);
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch(e) {}
+    }
+  }
 }
 
 function removeScript(name) {
   const p = scriptPath(name);
-  if (fs.existsSync(p)) fs.unlinkSync(p);
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch(e) {
+    try { execSync(`rm -f "${p}"`, { stdio: 'ignore' }); } catch(e2) {}
+  }
+}
+
+function isBinInPath() {
+  const pathDirs = (process.env.PATH || '').split(':');
+  return pathDirs.includes(BIN_DIR);
+}
+
+function getShellRC() {
+  const shell = process.env.SHELL || '/bin/zsh';
+  if (shell.includes('zsh')) return path.join(HOME, '.zshrc');
+  return path.join(HOME, '.bashrc');
 }
 
 function getAccountInfo(name) {
@@ -118,6 +177,28 @@ function formatBillingType(type) {
 
 // --- API ---
 
+app.get('/api/status', (req, res) => {
+  const binInPath = isBinInPath();
+  const shellRC = getShellRC();
+  const pathLine = `export PATH="${BIN_DIR}:$PATH"`;
+  res.json({ binDir: BIN_DIR, binInPath, shellRC, pathLine });
+});
+
+app.post('/api/fix-path', (req, res) => {
+  if (isBinInPath()) return res.json({ ok: true, already: true });
+
+  const rc = getShellRC();
+  const line = `\nexport PATH="${BIN_DIR}:$PATH"  # Claude Account Manager\n`;
+  try {
+    const content = fs.existsSync(rc) ? fs.readFileSync(rc, 'utf8') : '';
+    if (content.includes(BIN_DIR)) return res.json({ ok: true, already: true });
+    fs.appendFileSync(rc, line);
+    res.json({ ok: true, rc });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/accounts', (req, res) => {
   const meta = readMeta();
   const detailed = meta.accounts.map(name => ({
@@ -154,7 +235,7 @@ app.post('/api/accounts', (req, res) => {
   writeMeta(meta);
   generateScript(name);
 
-  res.json({ ok: true, command: `claude-${name}` });
+  res.json({ ok: true, command: `claude-${name}`, binDir: BIN_DIR, binInPath: isBinInPath() });
 });
 
 app.delete('/api/accounts/:name', (req, res) => {
@@ -345,6 +426,11 @@ function renderHTML(meta, lang, theme) {
       switchTo: 'en',
       exportBtn: 'تصدير',
       importBtn: 'استيراد',
+      pathWarning: 'الأوامر لن تعمل حتى تضيف المسار للـ PATH',
+      fixPathBtn: 'إصلاح تلقائي',
+      pathFixed: 'تم! أعد فتح الترمنال',
+      pathOk: 'المسار مضاف',
+      binDirLabel: 'مسار الأوامر:',
       user: 'المستخدم',
       email: 'الإيميل',
       org: 'المنظمة',
@@ -393,6 +479,11 @@ function renderHTML(meta, lang, theme) {
       switchTo: 'ar',
       exportBtn: 'Export',
       importBtn: 'Import',
+      pathWarning: 'Commands won\'t work until you add the path to PATH',
+      fixPathBtn: 'Auto Fix',
+      pathFixed: 'Done! Restart your terminal',
+      pathOk: 'Path is set',
+      binDirLabel: 'Commands path:',
       user: 'User',
       email: 'Email',
       org: 'Organization',
@@ -407,6 +498,7 @@ function renderHTML(meta, lang, theme) {
   const dir = lang === 'ar' ? 'rtl' : 'ltr';
   const htmlLang = lang === 'ar' ? 'ar' : 'en';
   const isDark = theme === 'dark';
+  const binInPath = isBinInPath();
 
   // Theme colors
   const bg = isDark ? '#0a0a0f' : '#f5f5f7';
@@ -583,6 +675,15 @@ function renderHTML(meta, lang, theme) {
     .color-dot:hover { transform: scale(1.15); }
     .color-dot.selected { border-color: ${text}; }
     #importInput { display: none; }
+    .path-banner {
+      background: #f9731622; border: 1px solid #f9731644; border-radius: 10px;
+      padding: 0.9rem 1.25rem; margin-bottom: 1.5rem; display: flex;
+      align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem;
+    }
+    .path-banner.ok { background: #16a34a15; border-color: #16a34a44; }
+    .path-banner-text { font-size: 0.85rem; }
+    .path-banner-text code { background: ${codeBg}; padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.75rem; color: ${codeColor}; }
+    .path-banner .btn-fix { background: #f97316; color: #fff; padding: 0.35rem 0.8rem; font-size: 0.8rem; }
   </style>
 </head>
 <body>
@@ -600,6 +701,14 @@ function renderHTML(meta, lang, theme) {
     </div>
     <h1>${s.title}</h1>
     <p class="subtitle">${s.subtitle}</p>
+    ${!binInPath ? `
+    <div class="path-banner" id="pathBanner">
+      <div class="path-banner-text">
+        &#9888; ${s.pathWarning}<br>
+        <small>${s.binDirLabel} <code>${BIN_DIR}</code></small>
+      </div>
+      <button class="btn btn-fix" onclick="fixPath()">${s.fixPathBtn}</button>
+    </div>` : ''}
     <div class="add-form">
       <h2>${s.addTitle}</h2>
       <div class="form-row">
@@ -786,6 +895,16 @@ function renderHTML(meta, lang, theme) {
         }
       } catch(e) { toast('Invalid file'); }
       event.target.value = '';
+    }
+
+    async function fixPath() {
+      const res = await fetch('/api/fix-path', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        toast(STR.pathFixed);
+        const banner = document.getElementById('pathBanner');
+        if (banner) { banner.classList.add('ok'); banner.querySelector('.btn-fix')?.remove(); banner.querySelector('.path-banner-text').innerHTML = '&#10003; ' + STR.pathFixed; }
+      }
     }
 
     // Auto-refresh status every 30s

@@ -10,6 +10,10 @@ Manage multiple Claude CLI accounts on the same machine.
 
 [English](#english) | [العربية](#العربية)
 
+<br>
+
+https://github.com/noor1yasser9/Claude-Account-Manager/releases/download/v1.0.0/demo.mp4
+
 </div>
 
 ---
@@ -34,11 +38,16 @@ No symlinks, no file copying, no session conflicts. Each account is **fully isol
 
 ### Features
 
-- Simple web UI to add and remove accounts
 - Each account gets a dedicated command (`claude-<name>`)
-- Login status indicator for each account
+- Account details: user name, email, organization, plan, model
+- Per-account model selection (Opus / Sonnet / Haiku)
+- Rename, lock/unlock, and color-code accounts
+- Export/import accounts as JSON
+- Auto-detect PATH issues with one-click fix
+- Dark / Light theme
 - Bilingual interface (Arabic / English)
-- Zero interference between accounts
+- Auto-refresh login status every 30s
+- Fully configurable via `.env`
 
 ### Requirements
 
@@ -51,6 +60,7 @@ No symlinks, no file copying, no session conflicts. Each account is **fully isol
 git clone https://github.com/noor1yasser9/Claude-Account-Manager.git
 cd Claude-Account-Manager
 npm install
+cp .env.example .env  # optional: customize settings
 ```
 
 ### Usage
@@ -78,6 +88,21 @@ claude-work    # opens Claude with Work's session
 ```
 
 Each command is independent. You can run multiple accounts simultaneously in different terminal windows.
+
+### Configuration
+
+Copy `.env.example` to `.env` and customize:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | Server port | `3737` |
+| `HOST` | Server host | `localhost` |
+| `ACCOUNTS_DIR` | Accounts storage path | `~/.claude-accounts` |
+| `BIN_DIR` | Commands directory | `/usr/local/bin` (auto-detected) |
+| `DEFAULT_LANG` | Default language (`ar` / `en`) | `ar` |
+| `DEFAULT_THEME` | Default theme (`dark` / `light`) | `dark` |
+| `AUTO_REFRESH_INTERVAL` | Status refresh interval (ms) | `30000` |
+| `DEFAULT_MODEL` | Default model for new accounts | _(empty)_ |
 
 ### How It Works
 
@@ -116,11 +141,16 @@ claude-test  ← يدخل بحساب التجربة
 
 ### المميزات
 
-- واجهة ويب بسيطة لإضافة وحذف الحسابات
 - كل حساب له أمر خاص (`claude-<name>`)
-- مؤشر حالة تسجيل الدخول لكل حساب
+- عرض تفاصيل الحساب: اسم المستخدم، الإيميل، المنظمة، الباقة، الموديل
+- إعدادات موديل لكل حساب (Opus / Sonnet / Haiku)
+- إعادة تسمية، قفل/فتح، وتلوين الحسابات
+- تصدير واستيراد الحسابات كـ JSON
+- كشف مشاكل الـ PATH تلقائياً مع إصلاح بضغطة واحدة
+- وضع داكن / فاتح
 - واجهة ثنائية اللغة (عربي / إنجليزي)
-- لا تداخل بين الحسابات أبداً
+- تحديث تلقائي لحالة الدخول كل 30 ثانية
+- إعدادات كاملة عبر `.env`
 
 ### المتطلبات
 
@@ -133,6 +163,7 @@ claude-test  ← يدخل بحساب التجربة
 git clone https://github.com/noor1yasser9/Claude-Account-Manager.git
 cd Claude-Account-Manager
 npm install
+cp .env.example .env  # اختياري: تخصيص الإعدادات
 ```
 
 ### التشغيل
@@ -160,6 +191,21 @@ claude-work    # يفتح Claude بجلسة العمل
 ```
 
 كل أمر مستقل. تقدر تشغّل عدة حسابات في نفس الوقت في نوافذ ترمنال مختلفة.
+
+### الإعدادات
+
+انسخ `.env.example` إلى `.env` وعدّل:
+
+| المتغير | الوصف | القيمة الافتراضية |
+|---------|-------|------------------|
+| `PORT` | بورت السيرفر | `3737` |
+| `HOST` | عنوان السيرفر | `localhost` |
+| `ACCOUNTS_DIR` | مسار حفظ الحسابات | `~/.claude-accounts` |
+| `BIN_DIR` | مسار الأوامر | `/usr/local/bin` (يُكتشف تلقائياً) |
+| `DEFAULT_LANG` | اللغة الافتراضية (`ar` / `en`) | `ar` |
+| `DEFAULT_THEME` | الثيم الافتراضي (`dark` / `light`) | `dark` |
+| `AUTO_REFRESH_INTERVAL` | فترة تحديث الحالة (مللي ثانية) | `30000` |
+| `DEFAULT_MODEL` | الموديل الافتراضي للحسابات الجديدة | _(فاضي)_ |
 
 ### آلية العمل
 
