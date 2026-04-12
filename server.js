@@ -1,15 +1,21 @@
+require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
 const app = express();
-const PORT = 3737;
-
 const HOME = os.homedir();
-const ACCOUNTS_DIR = path.join(HOME, '.claude-accounts');
-const BIN_DIR = '/usr/local/bin';
+
+const PORT = parseInt(process.env.PORT) || 3737;
+const HOST = process.env.HOST || 'localhost';
+const ACCOUNTS_DIR = (process.env.ACCOUNTS_DIR || '~/.claude-accounts').replace('~', HOME);
+const BIN_DIR = process.env.BIN_DIR || '/usr/local/bin';
 const META_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
+const DEFAULT_LANG = process.env.DEFAULT_LANG || 'ar';
+const DEFAULT_THEME = process.env.DEFAULT_THEME || 'dark';
+const AUTO_REFRESH_INTERVAL = parseInt(process.env.AUTO_REFRESH_INTERVAL) || 30000;
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
 
 const ACCOUNT_COLORS = ['#c4a35a','#2563eb','#dc2626','#16a34a','#9333ea','#ec4899','#f97316','#06b6d4','#84cc16','#f43f5e'];
 
@@ -137,6 +143,12 @@ app.post('/api/accounts', (req, res) => {
   }
 
   fs.mkdirSync(configDir(name), { recursive: true });
+
+  if (DEFAULT_MODEL) {
+    const settingsPath = path.join(configDir(name), 'settings.json');
+    fs.writeFileSync(settingsPath, JSON.stringify({ model: DEFAULT_MODEL }, null, 2));
+  }
+
   meta.accounts.push(name);
   meta.colors[name] = ACCOUNT_COLORS[meta.accounts.length % ACCOUNT_COLORS.length];
   writeMeta(meta);
@@ -287,8 +299,8 @@ app.post('/api/import', (req, res) => {
 // --- UI ---
 
 app.get('/', (req, res) => {
-  const lang = req.query.lang || 'ar';
-  const theme = req.query.theme || 'dark';
+  const lang = req.query.lang || DEFAULT_LANG;
+  const theme = req.query.theme || DEFAULT_THEME;
   res.send(renderHTML(readMeta(), lang, theme));
 });
 
@@ -785,7 +797,7 @@ function renderHTML(meta, lang, theme) {
         const currentFocus = document.activeElement?.id;
         if (currentFocus !== 'accountName') location.reload();
       } catch(e) {}
-    }, 30000);
+    }, ${AUTO_REFRESH_INTERVAL});
 
     document.getElementById('accountName').addEventListener('keydown', e => {
       if (e.key === 'Enter') addAccount();
@@ -800,7 +812,7 @@ function renderHTML(meta, lang, theme) {
 
 // --- Start ---
 ensureDirs();
-app.listen(PORT, () => {
+app.listen(PORT, HOST, () => {
   console.log(`\n  Claude Account Manager is running!`);
-  console.log(`  http://localhost:${PORT}\n`);
+  console.log(`  http://${HOST}:${PORT}\n`);
 });
