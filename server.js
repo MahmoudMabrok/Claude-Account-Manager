@@ -3,7 +3,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, exec } = require('child_process');
 
 const app = express();
 const HOME = os.homedir();
@@ -20,7 +20,11 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
 // Resolve BIN_DIR: use env, fallback to writable dir in PATH
 function resolveBinDir() {
   const envBin = process.env.BIN_DIR;
-  if (envBin) return envBin;
+  if (envBin) {
+    const resolvedPath = path.resolve(__dirname, envBin);
+    fs.mkdirSync(resolvedPath, { recursive: true });
+    return resolvedPath;
+  }
 
   // Try common dirs in order of preference
   const candidates = [
@@ -37,7 +41,7 @@ function resolveBinDir() {
       fs.writeFileSync(testFile, '', { mode: 0o755 });
       fs.unlinkSync(testFile);
       return dir;
-    } catch(e) { continue; }
+    } catch (e) { continue; }
   }
 
   // Last resort: use ~/.local/bin and create it
@@ -48,7 +52,7 @@ function resolveBinDir() {
 
 const BIN_DIR = resolveBinDir();
 
-const ACCOUNT_COLORS = ['#c4a35a','#2563eb','#dc2626','#16a34a','#9333ea','#ec4899','#f97316','#06b6d4','#84cc16','#f43f5e'];
+const ACCOUNT_COLORS = ['#c4a35a', '#2563eb', '#dc2626', '#16a34a', '#9333ea', '#ec4899', '#f97316', '#06b6d4', '#84cc16', '#f43f5e'];
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -100,16 +104,16 @@ exec env CLAUDE_CONFIG_DIR="${configDir(name)}" claude "$@"
   const dest = scriptPath(name);
   try {
     fs.writeFileSync(dest, script, { mode: 0o755 });
-  } catch(e) {
+  } catch (e) {
     // Try with sudo as fallback
     const tmpFile = path.join(os.tmpdir(), `claude-${name}`);
     fs.writeFileSync(tmpFile, script, { mode: 0o755 });
     try {
       execSync(`cp "${tmpFile}" "${dest}" && chmod 755 "${dest}"`, { stdio: 'ignore' });
-    } catch(e2) {
+    } catch (e2) {
       throw new Error(`Cannot write to ${BIN_DIR}. Set BIN_DIR in .env to a writable directory.`);
     } finally {
-      try { fs.unlinkSync(tmpFile); } catch(e) {}
+      try { fs.unlinkSync(tmpFile); } catch (e) { }
     }
   }
 }
@@ -118,14 +122,29 @@ function removeScript(name) {
   const p = scriptPath(name);
   try {
     if (fs.existsSync(p)) fs.unlinkSync(p);
-  } catch(e) {
-    try { execSync(`rm -f "${p}"`, { stdio: 'ignore' }); } catch(e2) {}
+  } catch (e) {
+    try { execSync(`rm -f "${p}"`, { stdio: 'ignore' }); } catch (e2) { }
   }
 }
 
 function isBinInPath() {
-  const pathDirs = (process.env.PATH || '').split(':');
-  return pathDirs.includes(BIN_DIR);
+  const pathDirs = (process.env.PATH || '').split(':').map(d => {
+    try { return path.resolve(d.replace('~', HOME)); } catch (e) { return d; }
+  });
+  const normalizedBinDir = path.resolve(BIN_DIR.replace('~', HOME));
+
+  if (pathDirs.includes(normalizedBinDir)) return true;
+
+  // Fallback: Check if it was added to the shell RC file but not yet loaded in this process
+  try {
+    const rc = getShellRC();
+    if (fs.existsSync(rc)) {
+      const content = fs.readFileSync(rc, 'utf8');
+      return content.includes(BIN_DIR);
+    }
+  } catch (e) { }
+
+  return false;
 }
 
 function getShellRC() {
@@ -153,14 +172,14 @@ function getAccountInfo(name) {
       // Last used from file modification time
       const stat = fs.statSync(claudeJson);
       info.lastUsed = stat.mtime.toISOString();
-    } catch(e) {}
+    } catch (e) { }
   }
 
   if (fs.existsSync(settingsJson)) {
     try {
       const settings = JSON.parse(fs.readFileSync(settingsJson, 'utf8'));
       info.model = settings.model || '';
-    } catch(e) {}
+    } catch (e) { }
   }
 
   return info;
@@ -194,7 +213,7 @@ app.post('/api/fix-path', (req, res) => {
     if (content.includes(BIN_DIR)) return res.json({ ok: true, already: true });
     fs.appendFileSync(rc, line);
     res.json({ ok: true, rc });
-  } catch(e) {
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
@@ -322,7 +341,7 @@ app.post('/api/accounts/:name/settings', (req, res) => {
   const settingsPath = path.join(dir, 'settings.json');
   let settings = {};
   if (fs.existsSync(settingsPath)) {
-    try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch(e) {}
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch (e) { }
   }
   if (model) settings.model = model;
   else delete settings.model;
@@ -931,7 +950,27 @@ function renderHTML(meta, lang, theme) {
 
 // --- Start ---
 ensureDirs();
-app.listen(PORT, HOST, () => {
-  console.log(`\n  Claude Account Manager is running!`);
-  console.log(`  http://${HOST}:${PORT}\n`);
-});
+function openBrowser(url) {
+  const start = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  exec(`${start} ${url}`);
+}
+
+function startServer(portToTry) {
+  app.listen(portToTry, HOST, (err) => {
+    if (err && err instanceof Error) {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`\n  Port ${portToTry} is in use, trying ${portToTry + 1}...`);
+        startServer(portToTry + 1);
+        return;
+      }
+      console.error(`\n  Failed to start server:`, err.message);
+      process.exit(1);
+    }
+    const url = `http://${HOST}:${portToTry}`;
+    console.log(`\n  Claude Account Manager is running!`);
+    console.log(`  ${url}\n`);
+    openBrowser(url);
+  });
+}
+
+startServer(PORT);
