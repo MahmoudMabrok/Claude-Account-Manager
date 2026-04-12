@@ -11,6 +11,8 @@ const ACCOUNTS_DIR = path.join(HOME, '.claude-accounts');
 const BIN_DIR = '/usr/local/bin';
 const META_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 
+const ACCOUNT_COLORS = ['#c4a35a','#2563eb','#dc2626','#16a34a','#9333ea','#ec4899','#f97316','#06b6d4','#84cc16','#f43f5e'];
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -29,13 +31,15 @@ function readMeta() {
       }
     }
   }
-  let saved = [];
+  let saved = { accounts: [], locked: [], colors: {} };
   if (fs.existsSync(META_FILE)) {
     const raw = JSON.parse(fs.readFileSync(META_FILE, 'utf8'));
-    saved = Array.isArray(raw.accounts) ? raw.accounts : [];
+    saved.accounts = Array.isArray(raw.accounts) ? raw.accounts : [];
+    saved.locked = Array.isArray(raw.locked) ? raw.locked : [];
+    saved.colors = raw.colors || {};
   }
-  const all = [...new Set([...saved, ...discovered])];
-  return { accounts: all };
+  const all = [...new Set([...saved.accounts, ...discovered])];
+  return { accounts: all, locked: saved.locked, colors: saved.colors };
 }
 
 function writeMeta(meta) {
@@ -65,27 +69,76 @@ function removeScript(name) {
   if (fs.existsSync(p)) fs.unlinkSync(p);
 }
 
+function getAccountInfo(name) {
+  const dir = configDir(name);
+  const claudeJson = path.join(dir, '.claude.json');
+  const settingsJson = path.join(dir, 'settings.json');
+  let info = { hasAuth: false, displayName: '', email: '', org: '', billingType: '', model: '', lastUsed: null };
+
+  if (fs.existsSync(claudeJson)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(claudeJson, 'utf8'));
+      info.hasAuth = !!data.hasCompletedOnboarding;
+      if (data.oauthAccount) {
+        info.displayName = data.oauthAccount.displayName || '';
+        info.email = data.oauthAccount.emailAddress || '';
+        info.org = data.oauthAccount.organizationName || '';
+        info.billingType = data.oauthAccount.billingType || '';
+      }
+      // Last used from file modification time
+      const stat = fs.statSync(claudeJson);
+      info.lastUsed = stat.mtime.toISOString();
+    } catch(e) {}
+  }
+
+  if (fs.existsSync(settingsJson)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsJson, 'utf8'));
+      info.model = settings.model || '';
+    } catch(e) {}
+  }
+
+  return info;
+}
+
+function formatBillingType(type) {
+  const map = {
+    stripe_subscription: 'Pro/Max',
+    api_billing: 'API',
+    free: 'Free',
+  };
+  return map[type] || type || '';
+}
+
 // --- API ---
 
 app.get('/api/accounts', (req, res) => {
-  res.json(readMeta());
+  const meta = readMeta();
+  const detailed = meta.accounts.map(name => ({
+    name,
+    ...getAccountInfo(name),
+    locked: meta.locked.includes(name),
+    color: meta.colors[name] || ACCOUNT_COLORS[meta.accounts.indexOf(name) % ACCOUNT_COLORS.length],
+  }));
+  res.json({ accounts: detailed });
 });
 
 app.post('/api/accounts', (req, res) => {
   const { name } = req.body;
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
-    return res.status(400).json({ error: 'اسم غير صالح. استخدم حروف، أرقام، - أو _ فقط.' });
+    return res.status(400).json({ error: 'invalid_name' });
   }
 
   ensureDirs();
   const meta = readMeta();
 
   if (meta.accounts.includes(name)) {
-    return res.status(409).json({ error: 'الحساب موجود مسبقاً.' });
+    return res.status(409).json({ error: 'already_exists' });
   }
 
   fs.mkdirSync(configDir(name), { recursive: true });
   meta.accounts.push(name);
+  meta.colors[name] = ACCOUNT_COLORS[meta.accounts.length % ACCOUNT_COLORS.length];
   writeMeta(meta);
   generateScript(name);
 
@@ -96,29 +149,150 @@ app.delete('/api/accounts/:name', (req, res) => {
   const { name } = req.params;
   const meta = readMeta();
   if (!meta.accounts.includes(name)) {
-    return res.status(404).json({ error: 'الحساب غير موجود.' });
+    return res.status(404).json({ error: 'not_found' });
+  }
+  if (meta.locked.includes(name)) {
+    return res.status(403).json({ error: 'locked' });
   }
 
   const dir = configDir(name);
-  if (fs.existsSync(dir)) {
-    fs.rmSync(dir, { recursive: true });
-  }
-
+  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
   removeScript(name);
   meta.accounts = meta.accounts.filter(a => a !== name);
+  meta.locked = meta.locked.filter(a => a !== name);
+  delete meta.colors[name];
   writeMeta(meta);
 
   res.json({ ok: true });
+});
+
+// Rename
+app.post('/api/accounts/:name/rename', (req, res) => {
+  const { name } = req.params;
+  const { newName } = req.body;
+  if (!newName || !/^[a-zA-Z0-9_-]+$/.test(newName)) {
+    return res.status(400).json({ error: 'invalid_name' });
+  }
+  const meta = readMeta();
+  if (!meta.accounts.includes(name)) return res.status(404).json({ error: 'not_found' });
+  if (meta.accounts.includes(newName)) return res.status(409).json({ error: 'already_exists' });
+
+  // Rename directory
+  const oldDir = configDir(name);
+  const newDir = configDir(newName);
+  if (fs.existsSync(oldDir)) fs.renameSync(oldDir, newDir);
+
+  // Rename script
+  removeScript(name);
+  generateScript(newName);
+
+  // Update meta
+  meta.accounts = meta.accounts.map(a => a === name ? newName : a);
+  meta.locked = meta.locked.map(a => a === name ? newName : a);
+  if (meta.colors[name]) { meta.colors[newName] = meta.colors[name]; delete meta.colors[name]; }
+  writeMeta(meta);
+
+  res.json({ ok: true, command: `claude-${newName}` });
+});
+
+// Lock/Unlock
+app.post('/api/accounts/:name/lock', (req, res) => {
+  const { name } = req.params;
+  const meta = readMeta();
+  if (!meta.accounts.includes(name)) return res.status(404).json({ error: 'not_found' });
+
+  if (meta.locked.includes(name)) {
+    meta.locked = meta.locked.filter(a => a !== name);
+  } else {
+    meta.locked.push(name);
+  }
+  writeMeta(meta);
+  res.json({ ok: true, locked: meta.locked.includes(name) });
+});
+
+// Color
+app.post('/api/accounts/:name/color', (req, res) => {
+  const { name } = req.params;
+  const { color } = req.body;
+  const meta = readMeta();
+  if (!meta.accounts.includes(name)) return res.status(404).json({ error: 'not_found' });
+  meta.colors[name] = color;
+  writeMeta(meta);
+  res.json({ ok: true });
+});
+
+// Settings (model)
+app.post('/api/accounts/:name/settings', (req, res) => {
+  const { name } = req.params;
+  const { model } = req.body;
+  const dir = configDir(name);
+  const settingsPath = path.join(dir, 'settings.json');
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch(e) {}
+  }
+  if (model) settings.model = model;
+  else delete settings.model;
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  res.json({ ok: true });
+});
+
+// Export
+app.get('/api/export', (req, res) => {
+  const meta = readMeta();
+  const data = { accounts: [] };
+  for (const name of meta.accounts) {
+    const info = getAccountInfo(name);
+    data.accounts.push({
+      name,
+      locked: meta.locked.includes(name),
+      color: meta.colors[name] || '',
+      model: info.model,
+    });
+  }
+  res.setHeader('Content-Disposition', 'attachment; filename=claude-accounts-export.json');
+  res.json(data);
+});
+
+// Import
+app.post('/api/import', (req, res) => {
+  const { accounts } = req.body;
+  if (!Array.isArray(accounts)) return res.status(400).json({ error: 'invalid_format' });
+
+  ensureDirs();
+  const meta = readMeta();
+  let added = 0;
+
+  for (const acct of accounts) {
+    if (!acct.name || !/^[a-zA-Z0-9_-]+$/.test(acct.name)) continue;
+    if (meta.accounts.includes(acct.name)) continue;
+
+    fs.mkdirSync(configDir(acct.name), { recursive: true });
+    meta.accounts.push(acct.name);
+    if (acct.color) meta.colors[acct.name] = acct.color;
+    if (acct.locked) meta.locked.push(acct.name);
+    generateScript(acct.name);
+
+    if (acct.model) {
+      const settingsPath = path.join(configDir(acct.name), 'settings.json');
+      fs.writeFileSync(settingsPath, JSON.stringify({ model: acct.model }, null, 2));
+    }
+    added++;
+  }
+
+  writeMeta(meta);
+  res.json({ ok: true, added });
 });
 
 // --- UI ---
 
 app.get('/', (req, res) => {
   const lang = req.query.lang || 'ar';
-  res.send(renderHTML(readMeta(), lang));
+  const theme = req.query.theme || 'dark';
+  res.send(renderHTML(readMeta(), lang, theme));
 });
 
-function renderHTML(meta, lang) {
+function renderHTML(meta, lang, theme) {
   const t = {
     ar: {
       title: 'Claude Account Manager',
@@ -126,8 +300,12 @@ function renderHTML(meta, lang) {
       addTitle: 'إضافة حساب جديد',
       placeholder: 'اسم الحساب (مثلاً: noor, work)',
       addBtn: 'إضافة',
-      copyBtn: 'نسخ الأمر',
+      copyBtn: 'نسخ',
       deleteBtn: 'حذف',
+      renameBtn: 'تسمية',
+      lockBtn: 'قفل',
+      unlockBtn: 'فتح',
+      settingsBtn: 'إعدادات',
       loggedIn: 'مسجّل دخول',
       needsLogin: 'بحاجة تسجيل دخول',
       empty: 'لا توجد حسابات بعد. أضف حسابك الأول!',
@@ -139,10 +317,30 @@ function renderHTML(meta, lang) {
       toastAdd: 'تم! استخدم: claude-',
       toastCopy: 'تم نسخ: ',
       toastDelete: 'تم حذف الحساب',
+      toastRename: 'تم تغيير الاسم',
+      toastLock: 'تم القفل',
+      toastUnlock: 'تم الفتح',
+      toastSettings: 'تم حفظ الإعدادات',
+      toastExport: 'تم التصدير',
+      toastImport: 'تم الاستيراد',
       confirmDelete: 'حذف الحساب ',
-      errorEmpty: 'الاسم مطلوب',
-      switchLang: 'English',
+      promptRename: 'الاسم الجديد:',
+      promptModel: 'اختر الموديل:',
+      errorInvalid: 'اسم غير صالح',
+      errorExists: 'الحساب موجود مسبقاً',
+      errorLocked: 'الحساب مقفل',
+      switchLang: 'EN',
       switchTo: 'en',
+      exportBtn: 'تصدير',
+      importBtn: 'استيراد',
+      user: 'المستخدم',
+      email: 'الإيميل',
+      org: 'المنظمة',
+      plan: 'الباقة',
+      model: 'الموديل',
+      lastUsed: 'آخر استخدام',
+      noModel: 'افتراضي',
+      never: 'لم يُستخدم',
     },
     en: {
       title: 'Claude Account Manager',
@@ -150,50 +348,100 @@ function renderHTML(meta, lang) {
       addTitle: 'Add New Account',
       placeholder: 'Account name (e.g. noor, work)',
       addBtn: 'Add',
-      copyBtn: 'Copy Command',
+      copyBtn: 'Copy',
       deleteBtn: 'Delete',
+      renameBtn: 'Rename',
+      lockBtn: 'Lock',
+      unlockBtn: 'Unlock',
+      settingsBtn: 'Settings',
       loggedIn: 'Logged in',
       needsLogin: 'Needs login',
       empty: 'No accounts yet. Add your first one!',
       howTitle: 'How it works:',
       step1: 'Add an account name',
       step2: 'Type the command in the terminal:',
-      step3: 'Log in — the session is saved automatically for this account only',
+      step3: 'Log in — session is saved automatically for this account only',
       step4: 'Each command is fully isolated — no interference',
       toastAdd: 'Done! Use: claude-',
       toastCopy: 'Copied: ',
       toastDelete: 'Account deleted',
+      toastRename: 'Renamed successfully',
+      toastLock: 'Account locked',
+      toastUnlock: 'Account unlocked',
+      toastSettings: 'Settings saved',
+      toastExport: 'Exported',
+      toastImport: 'Imported',
       confirmDelete: 'Delete account ',
-      errorEmpty: 'Name is required',
-      switchLang: 'العربية',
+      promptRename: 'New name:',
+      promptModel: 'Choose model:',
+      errorInvalid: 'Invalid name',
+      errorExists: 'Account already exists',
+      errorLocked: 'Account is locked',
+      switchLang: 'ع',
       switchTo: 'ar',
+      exportBtn: 'Export',
+      importBtn: 'Import',
+      user: 'User',
+      email: 'Email',
+      org: 'Organization',
+      plan: 'Plan',
+      model: 'Model',
+      lastUsed: 'Last used',
+      noModel: 'Default',
+      never: 'Never',
     }
   };
   const s = t[lang] || t.ar;
   const dir = lang === 'ar' ? 'rtl' : 'ltr';
   const htmlLang = lang === 'ar' ? 'ar' : 'en';
+  const isDark = theme === 'dark';
+
+  // Theme colors
+  const bg = isDark ? '#0a0a0f' : '#f5f5f7';
+  const cardBg = isDark ? '#14141f' : '#ffffff';
+  const border = isDark ? '#2a2a3a' : '#e0e0e5';
+  const text = isDark ? '#e0e0e0' : '#1a1a2e';
+  const textMuted = isDark ? '#888' : '#666';
+  const inputBg = isDark ? '#0a0a0f' : '#f0f0f3';
+  const codeBg = isDark ? '#0a0a0f' : '#eef0f4';
+  const codeColor = isDark ? '#8b8' : '#2d6a4f';
 
   const accountRows = meta.accounts.map(name => {
-    const acctDir = configDir(name);
-    let hasAuth = false;
-    const claudeJson = path.join(acctDir, '.claude.json');
-    if (fs.existsSync(claudeJson)) {
-      try {
-        const data = JSON.parse(fs.readFileSync(claudeJson, 'utf8'));
-        hasAuth = !!data.hasCompletedOnboarding;
-      } catch(e) {}
-    }
+    const info = getAccountInfo(name);
+    const isLocked = meta.locked.includes(name);
+    const color = meta.colors[name] || ACCOUNT_COLORS[meta.accounts.indexOf(name) % ACCOUNT_COLORS.length];
+    const billing = formatBillingType(info.billingType);
+    const lastUsedStr = info.lastUsed ? new Date(info.lastUsed).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : s.never;
+
     return `
-      <div class="account">
-        <div class="account-info">
-          <span class="account-name">${name}</span>
-          <code class="command">claude-${name}</code>
-          <span class="status ${hasAuth ? 'logged-in' : 'needs-login'}">${hasAuth ? s.loggedIn : s.needsLogin}</span>
+      <div class="account" style="border-color: ${color}40">
+        <div class="account-header">
+          <div class="account-identity">
+            <div class="avatar" style="background: ${color}">${name[0].toUpperCase()}</div>
+            <div>
+              <span class="account-name">${name}</span>
+              ${isLocked ? '<span class="lock-icon">&#128274;</span>' : ''}
+              <code class="command">claude-${name}</code>
+              <span class="status ${info.hasAuth ? 'logged-in' : 'needs-login'}">${info.hasAuth ? s.loggedIn : s.needsLogin}</span>
+            </div>
+          </div>
+          <div class="account-actions">
+            <button onclick="copyCmd('claude-${name}')" class="btn btn-sm btn-copy" title="${s.copyBtn}">${s.copyBtn}</button>
+            <button onclick="renameAccount('${name}')" class="btn btn-sm btn-rename" title="${s.renameBtn}">${s.renameBtn}</button>
+            <button onclick="toggleLock('${name}')" class="btn btn-sm btn-lock" title="${isLocked ? s.unlockBtn : s.lockBtn}">${isLocked ? s.unlockBtn : s.lockBtn}</button>
+            <button onclick="openSettings('${name}', '${info.model || ''}')" class="btn btn-sm btn-settings" title="${s.settingsBtn}">${s.settingsBtn}</button>
+            <button onclick="remove('${name}')" class="btn btn-sm btn-delete" ${isLocked ? 'disabled' : ''} title="${s.deleteBtn}">${s.deleteBtn}</button>
+          </div>
         </div>
-        <div class="account-actions">
-          <button onclick="copyCmd('claude-${name}')" class="btn btn-copy">${s.copyBtn}</button>
-          <button onclick="remove('${name}')" class="btn btn-delete">${s.deleteBtn}</button>
-        </div>
+        ${info.hasAuth ? `
+        <div class="account-details">
+          <div class="detail"><span class="detail-label">${s.user}</span><span>${info.displayName}</span></div>
+          <div class="detail"><span class="detail-label">${s.email}</span><span>${info.email}</span></div>
+          <div class="detail"><span class="detail-label">${s.org}</span><span>${info.org}</span></div>
+          <div class="detail"><span class="detail-label">${s.plan}</span><span>${billing}</span></div>
+          <div class="detail"><span class="detail-label">${s.model}</span><span>${info.model || s.noModel}</span></div>
+          <div class="detail"><span class="detail-label">${s.lastUsed}</span><span>${lastUsedStr}</span></div>
+        </div>` : ''}
       </div>`;
   }).join('');
 
@@ -207,74 +455,136 @@ function renderHTML(meta, lang) {
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #0a0a0f;
-      color: #e0e0e0;
-      min-height: 100vh;
-      padding: 2rem;
+      background: ${bg}; color: ${text};
+      min-height: 100vh; padding: 2rem;
+      transition: background 0.3s, color 0.3s;
     }
-    .container { max-width: 700px; margin: 0 auto; }
-    .top-bar { display: flex; justify-content: flex-end; margin-bottom: 1rem; }
-    .lang-btn {
-      background: none; border: 1px solid #2a2a3a; color: #c4a35a; padding: 0.3rem 0.8rem;
+    .container { max-width: 750px; margin: 0 auto; }
+    .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    .top-bar-actions { display: flex; gap: 0.5rem; align-items: center; }
+    .top-btn {
+      background: none; border: 1px solid ${border}; color: ${text}; padding: 0.3rem 0.7rem;
       border-radius: 8px; cursor: pointer; font-size: 0.8rem; font-weight: 600;
       transition: background 0.2s;
     }
-    .lang-btn:hover { background: #14141f; }
+    .top-btn:hover { background: ${cardBg}; }
+    .top-btn.accent { color: #c4a35a; border-color: #c4a35a44; }
     h1 { text-align: center; margin-bottom: 0.5rem; color: #c4a35a; font-size: 1.8rem; }
-    .subtitle { text-align: center; color: #888; margin-bottom: 2rem; font-size: 0.9rem; }
+    .subtitle { text-align: center; color: ${textMuted}; margin-bottom: 2rem; font-size: 0.9rem; }
     .add-form {
-      background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px;
+      background: ${cardBg}; border: 1px solid ${border}; border-radius: 12px;
       padding: 1.5rem; margin-bottom: 2rem;
     }
     .add-form h2 { color: #c4a35a; margin-bottom: 1rem; font-size: 1.1rem; }
     .form-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
     .form-row input[type="text"] {
       flex: 1; min-width: 200px; padding: 0.6rem 1rem; border-radius: 8px;
-      border: 1px solid #2a2a3a; background: #0a0a0f; color: #e0e0e0; font-size: 1rem;
+      border: 1px solid ${border}; background: ${inputBg}; color: ${text}; font-size: 1rem;
     }
     .form-row input:focus { outline: none; border-color: #c4a35a; }
     .btn {
       padding: 0.5rem 1rem; border: none; border-radius: 8px; cursor: pointer;
-      font-size: 0.85rem; font-weight: 600; transition: opacity 0.2s;
+      font-size: 0.85rem; font-weight: 600; transition: all 0.2s;
     }
     .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.75rem; }
     .btn-add { background: #c4a35a; color: #0a0a0f; }
-    .btn-copy { background: #2563eb; color: #fff; }
-    .btn-delete { background: #dc2626; color: #fff; }
-    .accounts-list { display: flex; flex-direction: column; gap: 0.75rem; }
+    .btn-copy { background: #2563eb22; color: #2563eb; border: 1px solid #2563eb44; }
+    .btn-rename { background: #9333ea22; color: #9333ea; border: 1px solid #9333ea44; }
+    .btn-lock { background: #f9731622; color: #f97316; border: 1px solid #f9731644; }
+    .btn-settings { background: #06b6d422; color: #06b6d4; border: 1px solid #06b6d444; }
+    .btn-delete { background: #dc262622; color: #dc2626; border: 1px solid #dc262644; }
+    .accounts-list { display: flex; flex-direction: column; gap: 1rem; }
     .account {
-      background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px;
-      padding: 1rem 1.25rem; display: flex; justify-content: space-between;
-      align-items: center; flex-wrap: wrap; gap: 0.75rem;
+      background: ${cardBg}; border: 2px solid ${border}; border-radius: 14px;
+      padding: 1.25rem; transition: border-color 0.2s;
     }
-    .account-info { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .account:hover { border-color: #c4a35a66; }
+    .account-header {
+      display: flex; justify-content: space-between; align-items: center;
+      flex-wrap: wrap; gap: 0.75rem;
+    }
+    .account-identity { display: flex; align-items: center; gap: 0.75rem; }
+    .avatar {
+      width: 38px; height: 38px; border-radius: 10px; display: flex;
+      align-items: center; justify-content: center; font-weight: 800;
+      font-size: 1rem; color: #fff; flex-shrink: 0;
+    }
     .account-name { font-weight: 700; font-size: 1.1rem; }
+    .lock-icon { font-size: 0.75rem; margin: 0 0.25rem; }
     .command {
-      display: inline-block; background: #0a0a0f; padding: 0.2rem 0.6rem;
-      border-radius: 6px; font-size: 0.8rem; color: #8b8;
+      display: inline-block; background: ${codeBg}; padding: 0.15rem 0.5rem;
+      border-radius: 6px; font-size: 0.75rem; color: ${codeColor}; margin: 0 0.4rem;
     }
-    .status { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 6px; }
+    .status { font-size: 0.7rem; padding: 0.12rem 0.45rem; border-radius: 6px; }
     .status.logged-in { background: #16a34a22; color: #4ade80; }
     .status.needs-login { background: #dc262622; color: #f87171; }
-    .account-actions { display: flex; gap: 0.5rem; }
-    .empty { text-align: center; color: #666; padding: 3rem; font-size: 1.1rem; }
+    .account-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .account-details {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 0.5rem; margin-top: 1rem; padding-top: 1rem;
+      border-top: 1px solid ${border};
+    }
+    .detail { display: flex; flex-direction: column; gap: 0.15rem; }
+    .detail-label { font-size: 0.7rem; color: ${textMuted}; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .detail span:last-child { font-size: 0.85rem; }
+    .empty { text-align: center; color: ${textMuted}; padding: 3rem; font-size: 1.1rem; }
     .how-it-works {
-      background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px;
-      padding: 1.25rem; margin-top: 2rem; font-size: 0.85rem; color: #888; line-height: 1.9;
+      background: ${cardBg}; border: 1px solid ${border}; border-radius: 12px;
+      padding: 1.25rem; margin-top: 2rem; font-size: 0.85rem; color: ${textMuted}; line-height: 1.9;
     }
     .how-it-works strong { color: #c4a35a; }
-    .how-it-works code { background: #0a0a0f; padding: 0.15rem 0.5rem; border-radius: 4px; color: #8b8; }
+    .how-it-works code { background: ${codeBg}; padding: 0.15rem 0.5rem; border-radius: 4px; color: ${codeColor}; }
     .toast {
       position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%);
       background: #c4a35a; color: #0a0a0f; padding: 0.75rem 1.5rem;
       border-radius: 10px; font-weight: 600; display: none; z-index: 100;
     }
+    /* Modal */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: #000a; z-index: 200;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: ${cardBg}; border: 1px solid ${border}; border-radius: 14px;
+      padding: 1.5rem; min-width: 320px; max-width: 90vw;
+    }
+    .modal h3 { color: #c4a35a; margin-bottom: 1rem; font-size: 1.1rem; }
+    .modal-row { margin-bottom: 1rem; }
+    .modal-row label { display: block; font-size: 0.85rem; color: ${textMuted}; margin-bottom: 0.3rem; }
+    .modal-row select, .modal-row input {
+      width: 100%; padding: 0.5rem 0.8rem; border-radius: 8px;
+      border: 1px solid ${border}; background: ${inputBg}; color: ${text}; font-size: 0.9rem;
+    }
+    .modal-row select:focus, .modal-row input:focus { outline: none; border-color: #c4a35a; }
+    .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+    .modal-actions .btn { padding: 0.5rem 1.2rem; }
+    .btn-cancel { background: ${inputBg}; color: ${text}; }
+    .btn-save { background: #c4a35a; color: #0a0a0f; }
+    .color-picker { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .color-dot {
+      width: 28px; height: 28px; border-radius: 50%; cursor: pointer; border: 3px solid transparent;
+      transition: border-color 0.2s, transform 0.15s;
+    }
+    .color-dot:hover { transform: scale(1.15); }
+    .color-dot.selected { border-color: ${text}; }
+    #importInput { display: none; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="top-bar">
-      <button class="lang-btn" onclick="switchLang()">${s.switchLang}</button>
+      <div class="top-bar-actions">
+        <button class="top-btn accent" onclick="switchLang()">${s.switchLang}</button>
+        <button class="top-btn" onclick="toggleTheme()">${isDark ? '&#9788;' : '&#9790;'}</button>
+      </div>
+      <div class="top-bar-actions">
+        <button class="top-btn" onclick="exportAccounts()">${s.exportBtn}</button>
+        <button class="top-btn" onclick="document.getElementById('importInput').click()">${s.importBtn}</button>
+        <input type="file" id="importInput" accept=".json" onchange="importAccounts(event)" />
+      </div>
     </div>
     <h1>${s.title}</h1>
     <p class="subtitle">${s.subtitle}</p>
@@ -285,7 +595,7 @@ function renderHTML(meta, lang) {
         <button class="btn btn-add" onclick="addAccount()">${s.addBtn}</button>
       </div>
     </div>
-    <div class="accounts-list">
+    <div class="accounts-list" id="accountsList">
       ${accountRows || `<div class="empty">${s.empty}</div>`}
     </div>
     <div class="how-it-works">
@@ -296,13 +606,50 @@ function renderHTML(meta, lang) {
       4. ${s.step4}
     </div>
   </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal">
+      <h3>${s.settingsBtn}</h3>
+      <input type="hidden" id="settingsName" />
+      <div class="modal-row">
+        <label>${s.model}</label>
+        <select id="settingsModel">
+          <option value="">${s.noModel}</option>
+          <option value="claude-opus-4-6">Claude Opus 4.6</option>
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+        </select>
+      </div>
+      <div class="modal-row">
+        <label>Color</label>
+        <div class="color-picker" id="colorPicker">
+          ${ACCOUNT_COLORS.map(c => `<div class="color-dot" style="background:${c}" data-color="${c}" onclick="selectColor('${c}')"></div>`).join('')}
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-cancel" onclick="closeSettings()">${lang === 'ar' ? 'إلغاء' : 'Cancel'}</button>
+        <button class="btn btn-save" onclick="saveSettings()">${lang === 'ar' ? 'حفظ' : 'Save'}</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
   <script>
     const LANG = "${lang}";
+    const THEME = "${theme}";
     const STR = ${JSON.stringify(s)};
+    let selectedColor = '';
 
     function switchLang() {
-      window.location.href = '/?lang=' + STR.switchTo;
+      const url = new URL(location.href);
+      url.searchParams.set('lang', STR.switchTo);
+      location.href = url;
+    }
+    function toggleTheme() {
+      const url = new URL(location.href);
+      url.searchParams.set('theme', THEME === 'dark' ? 'light' : 'dark');
+      location.href = url;
     }
     function toast(msg) {
       const t = document.getElementById('toast');
@@ -323,7 +670,8 @@ function renderHTML(meta, lang) {
         toast(STR.toastAdd + name);
         setTimeout(() => location.reload(), 800);
       } else {
-        toast(data.error);
+        const errMap = { invalid_name: STR.errorInvalid, already_exists: STR.errorExists };
+        toast(errMap[data.error] || data.error);
       }
     }
     function copyCmd(cmd) {
@@ -332,13 +680,118 @@ function renderHTML(meta, lang) {
     async function remove(name) {
       if (!confirm(STR.confirmDelete + name + '?')) return;
       const res = await fetch('/api/accounts/' + name, { method: 'DELETE' });
+      const data = await res.json();
       if (res.ok) {
         toast(STR.toastDelete);
         setTimeout(() => location.reload(), 800);
+      } else {
+        const errMap = { locked: STR.errorLocked };
+        toast(errMap[data.error] || data.error);
       }
     }
+    async function renameAccount(name) {
+      const newName = prompt(STR.promptRename, name);
+      if (!newName || newName === name) return;
+      const res = await fetch('/api/accounts/' + name + '/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newName })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast(STR.toastRename);
+        setTimeout(() => location.reload(), 800);
+      } else {
+        const errMap = { invalid_name: STR.errorInvalid, already_exists: STR.errorExists };
+        toast(errMap[data.error] || data.error);
+      }
+    }
+    async function toggleLock(name) {
+      const res = await fetch('/api/accounts/' + name + '/lock', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        toast(data.locked ? STR.toastLock : STR.toastUnlock);
+        setTimeout(() => location.reload(), 800);
+      }
+    }
+    function openSettings(name, currentModel) {
+      document.getElementById('settingsName').value = name;
+      document.getElementById('settingsModel').value = currentModel;
+      selectedColor = '';
+      document.querySelectorAll('.color-dot').forEach(d => d.classList.remove('selected'));
+      document.getElementById('settingsModal').classList.add('show');
+    }
+    function closeSettings() {
+      document.getElementById('settingsModal').classList.remove('show');
+    }
+    function selectColor(c) {
+      selectedColor = c;
+      document.querySelectorAll('.color-dot').forEach(d => {
+        d.classList.toggle('selected', d.dataset.color === c);
+      });
+    }
+    async function saveSettings() {
+      const name = document.getElementById('settingsName').value;
+      const model = document.getElementById('settingsModel').value;
+
+      await fetch('/api/accounts/' + name + '/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model })
+      });
+
+      if (selectedColor) {
+        await fetch('/api/accounts/' + name + '/color', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ color: selectedColor })
+        });
+      }
+
+      toast(STR.toastSettings);
+      closeSettings();
+      setTimeout(() => location.reload(), 800);
+    }
+    function exportAccounts() {
+      window.open('/api/export', '_blank');
+      toast(STR.toastExport);
+    }
+    async function importAccounts(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const text = await file.text();
+      try {
+        const data = JSON.parse(text);
+        const res = await fetch('/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        });
+        if (res.ok) {
+          const r = await res.json();
+          toast(STR.toastImport + ' (' + r.added + ')');
+          setTimeout(() => location.reload(), 800);
+        }
+      } catch(e) { toast('Invalid file'); }
+      event.target.value = '';
+    }
+
+    // Auto-refresh status every 30s
+    setInterval(async () => {
+      try {
+        const res = await fetch('/api/accounts');
+        if (!res.ok) return;
+        // Soft reload to update status
+        const currentFocus = document.activeElement?.id;
+        if (currentFocus !== 'accountName') location.reload();
+      } catch(e) {}
+    }, 30000);
+
     document.getElementById('accountName').addEventListener('keydown', e => {
       if (e.key === 'Enter') addAccount();
+    });
+    document.getElementById('settingsModal').addEventListener('click', e => {
+      if (e.target === document.getElementById('settingsModal')) closeSettings();
     });
   </script>
 </body>
